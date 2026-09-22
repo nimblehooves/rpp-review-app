@@ -55,6 +55,17 @@ const statusMeta = {
   approval: ["Согласование", "approval"],
   complete: ["Завершено", "complete"]
 };
+const workflowTransitions = {
+  manager: {
+    draft: ["self_assessment", "Передать сотруднику"],
+    manager_review: ["meeting", "Перейти к встрече"],
+    meeting: ["approval", "Передать на согласование"],
+    approval: ["complete", "Завершить ревью"]
+  },
+  employee: {
+    self_assessment: ["manager_review", "Отправить руководителю"]
+  }
+};
 const roleNames = { manager: "Руководитель", employee: "Сотрудник" };
 const resultNames = { done: "Выполнено", partial: "Частично", missed: "Не выполнено", not_set: "Без оценки" };
 
@@ -86,7 +97,8 @@ function initials(name) { return name.split(/\s+/).map(part => part[0]).slice(0,
 function escapeHtml(value = "") { return String(value).replace(/[&<>'"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char])); }
 function formatDate(value) { return value ? new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "long", year: "numeric" }).format(new Date(`${value}T12:00:00`)) : "Не назначена"; }
 function statusBadge(status) { const meta = statusMeta[status] || statusMeta.draft; return `<span class="badge ${meta[1]}">${meta[0]}</span>`; }
-function showToast(message) { const toast = document.querySelector("#toast"); toast.textContent = message; toast.classList.add("show"); clearTimeout(showToast.timer); showToast.timer = setTimeout(() => toast.classList.remove("show"), 2200); }
+function showToast(message, duration = 2200) { const toast = document.querySelector("#toast"); toast.textContent = message; toast.classList.add("show"); clearTimeout(showToast.timer); showToast.timer = setTimeout(() => toast.classList.remove("show"), duration); }
+function reviewTransition(review) { return workflowTransitions[currentUser().role]?.[review.status] || null; }
 
 function allowedNav() {
   const person = currentUser();
@@ -244,6 +256,7 @@ function renderReview(app) {
   if (!review || !accessibleReviews().some(item => item.id === review.id)) { state.currentView = allowedNav()[0].id; renderShell(); return; }
   const employee = user(review.employeeId);
   const isManager = currentUser().role === "manager";
+  const transition = reviewTransition(review);
   app.innerHTML = `<div class="review-hero"><div><span class="badge ${statusMeta[review.status][1]}">${statusMeta[review.status][0]}</span><h2 style="margin-top:12px">${escapeHtml(employee.name)}</h2><p>${escapeHtml(employee.position)} · ${escapeHtml(review.period)}</p><div class="review-meta"><span>Встреча: ${formatDate(review.reviewDate)}</span><span>Руководитель: ${escapeHtml(user(review.managerId).name)}</span></div></div><button class="button secondary" data-nav="${isManager ? "reviews" : "dashboard"}">← Назад</button></div>
     <form id="review-form" class="review-form">
       <section class="section-card"><div class="section-title"><div><h2>Цели периода</h2><p>${isManager ? "Зафиксируйте итог и основания оценки" : "Опишите фактический результат по каждой цели"}</p></div>${isManager ? '<button type="button" class="button secondary" id="add-goal">Добавить цель</button>' : ""}</div><div id="goals-list">${review.goals.map((goal, index) => goalEditor(goal, index, isManager)).join("")}</div></section>
@@ -253,7 +266,7 @@ function renderReview(app) {
         <label class="field wide">Цели следующего периода<textarea name="nextGoals" ${isManager ? "" : "readonly"}>${escapeHtml(review.nextGoals)}</textarea></label>
       </div></section>
       ${isManager ? `<section class="section-card private-box"><span class="private-label">Только для руководителя</span><h2>Личные заметки</h2><p class="muted">Сотрудник не видит это поле.</p><textarea name="privateNotes" style="margin-top:12px">${escapeHtml(review.privateNotes)}</textarea></section>` : ""}
-      <div class="sticky-actions"><div class="toolbar">${isManager ? `<label style="display:grid;grid-template-columns:auto 210px;gap:9px;align-items:center">Этап<select name="status">${Object.entries(statusMeta).map(([key, value]) => `<option value="${key}" ${key === review.status ? "selected" : ""}>${value[0]}</option>`).join("")}</select></label>` : ""}</div><div class="toolbar"><button type="button" class="button secondary" data-nav="${isManager ? "reviews" : "dashboard"}">Отмена</button><button type="submit" class="button primary">Сохранить изменения</button></div></div>
+      <div class="sticky-actions"><div class="workflow-next">${transition ? `<span>Следующий этап</span><strong>${statusMeta[transition[0]][0]}</strong>` : `<span>Текущий этап</span><strong>${review.status === "complete" ? "Ревью завершено" : "Ожидается действие другой стороны"}</strong>`}</div><div class="toolbar"><button type="button" class="button secondary" data-nav="${isManager ? "reviews" : "dashboard"}">Отмена</button><button type="submit" class="button secondary" data-submit-intent="save">Сохранить изменения</button>${transition ? `<button type="submit" class="button primary" data-submit-intent="advance">${transition[1]} →</button>` : ""}</div></div>
     </form>`;
 }
 
@@ -274,7 +287,17 @@ function openCreateReview() {
   document.querySelector("#new-review-dialog").showModal();
 }
 
-function saveReview(form) {
+function transitionValidationMessage(review) {
+  if (review.status === "draft" && review.goals.some(goal => !goal.title.trim() || !goal.criteria.trim())) return "Заполните цель и критерий достижения перед передачей сотруднику";
+  if (review.status === "self_assessment" && !review.employeeSummary.trim()) return "Заполните самооценку перед отправкой руководителю";
+  if (review.status === "manager_review") {
+    if (review.goals.some(goal => !goal.result || goal.result === "not_set")) return "Оцените результат по каждой цели перед переходом к встрече";
+    if (!review.strengths.trim() || !review.development.trim() || !review.nextGoals.trim()) return "Заполните сильные стороны, зоны развития и цели следующего периода";
+  }
+  return "";
+}
+
+function saveReview(form, intent = "save") {
   const review = state.reviews.find(item => item.id === selectedReviewId);
   const data = new FormData(form);
   review.employeeSummary = data.get("employeeSummary") || "";
@@ -290,7 +313,20 @@ function saveReview(form) {
     review.development = data.get("development") || "";
     review.nextGoals = data.get("nextGoals") || "";
     review.privateNotes = data.get("privateNotes") || "";
-    review.status = data.get("status") || review.status;
+  }
+  if (intent === "advance") {
+    const transition = reviewTransition(review);
+    const validationMessage = transitionValidationMessage(review);
+    if (!transition || validationMessage) {
+      persist();
+      showToast(validationMessage || "Для текущего этапа переход недоступен", 4200);
+      return;
+    }
+    review.status = transition[0];
+    persist();
+    showToast(`Ревью переведено на этап «${statusMeta[review.status][0]}»`, 3200);
+    renderShell();
+    return;
   }
   persist(); showToast("Изменения сохранены"); renderShell();
 }
@@ -326,7 +362,8 @@ document.querySelector("#new-review-form").addEventListener("submit", event => {
 });
 document.addEventListener("submit", event => {
   if (event.target.id !== "review-form") return;
-  event.preventDefault(); saveReview(event.target);
+  event.preventDefault();
+  saveReview(event.target, event.submitter?.dataset.submitIntent || "save");
 });
 document.addEventListener("input", event => {
   if (event.target.id !== "user-search") return;
